@@ -1,0 +1,380 @@
+name: Build and Push Stable Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        default: 'latest'
+        description: 'Package version'
+        type: string
+        required: true
+  schedule:
+    - cron: '0 20 * * *'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GO_VERSION: "1.26.1"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10"
+  ARTIFACT_RETENTION_DAYS: 60
+  ARTIFACT_PREFIX: memos
+
+jobs:
+  prepare:
+    runs-on: ubuntu-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      major_minor: ${{ steps.version.outputs.major_minor }}
+      app_build: ${{ steps.check-release.outputs.app_build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.version }}" = "latest" ]; then
+            app_version=$(curl -s "https://api.github.com/repos/usememos/memos/releases/latest" | jq -r .tag_name)
+          else
+            app_version=${{ github.event.inputs.version }}
+          fi
+          if [ -z "${app_version}" ] || [ "${app_version}" == "null" ]; then
+            echo "Failed to get version"
+            exit 1
+          fi
+          
+          echo "app_version=${app_version}" >> $GITHUB_ENV
+          echo ""
+          echo "========== Build Args =========="
+          echo "app_version=${app_version}"
+
+          echo "tag=${app_version}" >> "$GITHUB_OUTPUT"
+          echo "version=${app_version#v}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${version%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Check Release
+        id: check-release
+        run: |
+          gh release view ${{ steps.version.outputs.tag }} -R ${{ github.repository }} | grep memos_${{ steps.version.outputs.tag }}_linux_loong64.tar.gz >/dev/null 2>&1 || echo "app_build=1" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-frontend:
+    name: Build Frontend
+    needs: prepare
+    if: needs.prepare.outputs.app_build == '1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          repository: usememos/memos
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4.2.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend release assets
+        working-directory: web
+        run: pnpm release
+
+      - name: Upload frontend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: server/router/frontend/dist
+          retention-days: 1
+
+  build-binaries:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+    needs: [prepare, build-frontend]
+    if: needs.prepare.outputs.app_build == '1'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: "386"
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: linux
+            goarch: loong64
+          - goos: linux
+            goarch: ppc64le
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: riscv64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          repository: usememos/memos
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: server/router/frontend/dist
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          output_name="memos"
+          if [ "$GOOS" = "windows" ]; then
+            output_name="memos.exe"
+          fi
+
+          mkdir -p build
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X github.com/usememos/memos/internal/version.Version=${{ needs.prepare.outputs.version }} -X github.com/usememos/memos/internal/version.Commit=${{ github.sha }} -extldflags '-static'" \
+            -tags netgo,osusergo \
+            -o "build/${output_name}" \
+            ./cmd/memos
+
+      - name: Package binary
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          cd build
+
+          package_name="${ARTIFACT_PREFIX}_${VERSION}_${GOOS}_${GOARCH}"
+          if [ -n "$GOARM" ]; then
+            package_name="${package_name}v${GOARM}"
+          fi
+
+          if [ "$GOOS" = "windows" ]; then
+            artifact_name="${package_name}.zip"
+            zip -q "${artifact_name}" memos.exe
+          else
+            artifact_name="${package_name}.tar.gz"
+            tar czf "${artifact_name}" memos
+          fi
+
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_ENV"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.artifact_name }}
+          path: build/${{ env.artifact_name }}
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  checksums:
+    name: Generate Checksums
+    needs: [prepare, build-binaries]
+    if: needs.prepare.outputs.app_build == '1'
+    runs-on: ubuntu-slim
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ env.ARTIFACT_PREFIX }}_*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum * > checksums.txt
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/checksums.txt
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, build-binaries, checksums]
+    if: needs.prepare.outputs.app_build == '1'
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ env.ARTIFACT_PREFIX }}_*
+          merge-multiple: true
+
+      - name: Download checksum artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: artifacts
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          prerelease: false
+          files: artifacts/*
+
+  build-push:
+    name: Build Image ${{ matrix.platform }}
+    needs: [prepare, build-frontend]
+    if: needs.prepare.outputs.app_build == '1'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+          - linux/loong64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          repository: usememos/memos
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: server/router/frontend/dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepar build
+        run: |
+          sed -i 's@FROM golang@FROM ghcr.io/loong64/golang@g' scripts/Dockerfile
+          sed -i 's@FROM alpine@FROM ghcr.io/loong64/alpine@g' scripts/Dockerfile
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./scripts/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=release-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/neosmemo/memos,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-images:
+    name: Publish Release Image Tags
+    needs: [prepare, build-push]
+    if: needs.prepare.outputs.app_build == '1'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository_owner }}/neosmemo/memos:${version}" \
+            -t "ghcr.io/${{ github.repository_owner }}/neosmemo/memos:${{ needs.prepare.outputs.major_minor }}" \
+            -t "ghcr.io/${{ github.repository_owner }}/neosmemo/memos:stable" \
+            $(printf 'ghcr.io/${{ github.repository_owner }}/neosmemo/memos@sha256:%s ' *)
+
+      - name: Inspect images
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/neosmemo/memos:stable
