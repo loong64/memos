@@ -45,15 +45,19 @@ jobs:
             echo "Failed to get version"
             exit 1
           fi
-          
-          echo "app_version=${app_version}" >> $GITHUB_ENV
+
+          tag=${app_version}
+          version=${app_version#v}
+          major_minor=${version%.*}
           echo ""
           echo "========== Build Args =========="
-          echo "app_version=${app_version}"
+          echo "tag=${tag}"
+          echo "version=${version}"
+          echo "major_minor=${major_minor}"
 
-          echo "tag=${app_version}" >> "$GITHUB_OUTPUT"
-          echo "version=${app_version#v}" >> "$GITHUB_OUTPUT"
-          echo "major_minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
 
       - name: Check Release
         id: check-release
